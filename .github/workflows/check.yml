@@ -1,0 +1,26 @@
+name: Check lab
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Install networking tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iproute2 iputils-ping iputils-arping tcpdump procps util-linux nftables shellcheck
+      - name: Check shell scripts
+        run: |
+          bash -n lab.sh
+          bash -n tests/integration.sh
+          shellcheck lab.sh tests/integration.sh
+      - name: Exercise the network and cleanup
+        run: sudo bash tests/integration.sh
