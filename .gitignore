@@ -1,0 +1,11 @@
+.cache/
+*.pcap
+*.pcapng
+.env
+.env.*
+*.pem
+*.key
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
