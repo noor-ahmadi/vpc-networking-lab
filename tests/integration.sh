@@ -74,6 +74,12 @@ for cycle in 1 2; do
     bash ./lab.sh up
     bash ./lab.sh status
     bash ./lab.sh check
+    # A reply from a different subnet requires forwarding and both host routes.
+    ip -n vpc-app neigh flush dev eth0
+    ip netns exec vpc-app ping -n -c 1 -W 2 10.0.3.10 >/dev/null
+    ip -n vpc-app neigh show 10.0.2.1 dev eth0 | grep -q 'lladdr'
+    [[ -z $(ip -n vpc-app neigh show 10.0.3.10 dev eth0) ]] || fail 'App resolved the remote host instead of its gateway'
+    printf 'PASS: routed traffic resolves the gateway MAC, not the remote host\n'
     bash ./lab.sh arp | tee "$scratch/arp"
     grep -q 'Request who-has 10.0.1.20 tell 10.0.1.10' "$scratch/arp"
     grep -q 'Reply 10.0.1.20 is-at' "$scratch/arp"
@@ -103,6 +109,20 @@ for cycle in 1 2; do
         ip -n vpc-switch link set app master br-private
         bash ./lab.sh check
         printf 'PASS: connectivity checks detect and recover from a miswired port\n'
+
+        ip netns exec vpc-router sysctl -q -w net.ipv4.ip_forward=0
+        ip netns exec vpc-web ping -n -c 1 -W 2 10.0.1.20 >/dev/null
+        expect_failure bash ./lab.sh check
+        ip netns exec vpc-router sysctl -q -w net.ipv4.ip_forward=1
+        bash ./lab.sh check
+        printf 'PASS: forwarding failure breaks routed traffic while local peers still work\n'
+
+        ip -n vpc-db route delete default
+        ip netns exec vpc-db ping -n -c 1 -W 2 10.0.3.1 >/dev/null
+        expect_failure bash ./lab.sh check
+        ip -n vpc-db route add default via 10.0.3.1 dev eth0
+        bash ./lab.sh check
+        printf 'PASS: checks detect and recover from a missing database return route\n'
     fi
 
     bash ./lab.sh down
@@ -129,4 +149,4 @@ printf 'PASS: replaced namespace is preserved\n'
 ip netns delete vpc-sentinel
 snapshot_host > "$scratch/after"
 diff -u "$scratch/before" "$scratch/after" || fail 'Host network configuration changed'
-printf '\nPASS: two full cycles, conflict and ownership guards, ARP capture, fault detection, and unchanged host network\n'
+printf '\nPASS: two full cycles, ownership guards, ARP, routed traffic and return paths, fault detection, and unchanged host network\n'

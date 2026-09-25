@@ -16,10 +16,10 @@ usage() {
     cat <<'USAGE'
 Usage: sudo ./lab.sh {up|down|status|check|arp}
 
-  up      Create three Ethernet segments with forwarding disabled.
+  up      Create three subnet segments and enable internal routing.
   down    Remove this lab's namespaces; refuse busy or replaced ones.
   status  Show interfaces, addresses, and routes.
-  check   Verify local connectivity, ARP, and subnet separation.
+  check   Verify local and routed connectivity, ARP, and subnet separation.
   arp     Capture an ARP request and reply on the public segment.
 
 Requires Linux and root. See docs/local-lab.md for dependencies and topology.
@@ -117,8 +117,14 @@ up() {
     connect vpc-nat eth0 nat br-public 10.0.1.20/24
     connect vpc-app eth0 app br-private 10.0.2.10/24
     connect vpc-db eth0 db br-isolated 10.0.3.10/24
+    # Hosts send off-subnet packets to the router; connected routes handle replies.
+    ip -n vpc-web route add default via 10.0.1.1 dev eth0
+    ip -n vpc-nat route add default via 10.0.1.1 dev eth0
+    ip -n vpc-app route add default via 10.0.2.1 dev eth0
+    ip -n vpc-db route add default via 10.0.3.1 dev eth0
+    ip netns exec vpc-router sysctl -q -w net.ipv4.ip_forward=1
     trap - EXIT
-    printf 'Lab created: three subnet bridges, six namespaces, forwarding disabled.\n'
+    printf 'Lab created: three subnet bridges, six namespaces, internal routing enabled.\n'
 }
 
 status() {
@@ -152,6 +158,17 @@ vpc-db 10.0.3.1
 vpc-router 10.0.2.10
 vpc-router 10.0.3.10
 PEERS
+    while read -r namespace target; do
+        ip netns exec "$namespace" ping -n -c 1 -W 2 "$target" >/dev/null || die "$namespace cannot reach $target through the router"
+        printf 'PASS: %s reaches %s through the router\n' "$namespace" "$target"
+    done <<'ROUTED_PEERS'
+vpc-web 10.0.2.10
+vpc-app 10.0.1.10
+vpc-app 10.0.3.10
+vpc-db 10.0.2.10
+vpc-db 10.0.1.20
+vpc-nat 10.0.3.10
+ROUTED_PEERS
     ip netns exec vpc-web arping -I eth0 -c 1 -w 2 10.0.1.20 >/dev/null || die 'Public peer did not answer ARP'
     printf 'PASS: public peers exchange ARP\n'
     # These destinations were just reached from their own segment above.
@@ -161,13 +178,11 @@ PEERS
         fi
         printf 'PASS: public ARP does not reach %s\n' "$target"
     done
-    for namespace in vpc-web vpc-nat vpc-app vpc-db; do
-        if ip -n "$namespace" route get 203.0.113.10 >/dev/null 2>&1; then
-            die "$namespace unexpectedly has an external route"
-        fi
-    done
-    [[ $(ip netns exec vpc-router sysctl -n net.ipv4.ip_forward) == 0 ]] || die 'Router forwarding is unexpectedly enabled'
-    printf 'PASS: workloads have no external route; router forwarding is disabled\n'
+    if ip -n vpc-router route get 203.0.113.10 >/dev/null 2>&1; then
+        die 'Router unexpectedly has an external route'
+    fi
+    [[ $(ip netns exec vpc-router sysctl -n net.ipv4.ip_forward) == 1 ]] || die 'Router forwarding is disabled'
+    printf 'PASS: internal routing works; router has no external route\n'
 }
 
 capture_arp() {
