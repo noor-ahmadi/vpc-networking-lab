@@ -16,10 +16,10 @@ usage() {
     cat <<'USAGE'
 Usage: sudo ./lab.sh {up|down|status|check|arp}
 
-  up      Create three subnet segments and enable internal routing.
+  up      Create three subnet segments with independent routing policies.
   down    Remove this lab's namespaces; refuse busy or replaced ones.
-  status  Show interfaces, addresses, and routes.
-  check   Verify local and routed connectivity, ARP, and subnet separation.
+  status  Show interfaces, addresses, routes, and policy rules.
+  check   Verify connectivity, ARP, and subnet routing policies.
   arp     Capture an ARP request and reply on the public segment.
 
 Requires Linux and root. See docs/local-lab.md for dependencies and topology.
@@ -93,7 +93,7 @@ connect() {
 
 up() {
     [[ ! -e "$STATE" ]] || die "Lab state already exists; inspect status or run down first"
-    local name bridge
+    local name bridge table
     for name in "${NAMESPACES[@]}"; do
         [[ ! -e "$NETNS/$name" ]] || die "$name already exists; leaving it untouched"
     done
@@ -122,9 +122,21 @@ up() {
     ip -n vpc-nat route add default via 10.0.1.1 dev eth0
     ip -n vpc-app route add default via 10.0.2.1 dev eth0
     ip -n vpc-db route add default via 10.0.3.1 dev eth0
+
+    # Each ingress subnet selects its own table, like a subnet route association.
+    for table in 101 102 103; do
+        ip -n vpc-router route add table "$table" 10.0.1.0/24 dev public scope link
+        ip -n vpc-router route add table "$table" 10.0.2.0/24 dev private scope link
+        ip -n vpc-router route add table "$table" 10.0.3.0/24 dev isolated scope link
+        # A missing route would fall through to main; unreachable stops lookup.
+        ip -n vpc-router route add table "$table" unreachable default
+    done
+    ip -n vpc-router rule add priority 101 iif public lookup 101
+    ip -n vpc-router rule add priority 102 iif private lookup 102
+    ip -n vpc-router rule add priority 103 iif isolated lookup 103
     ip netns exec vpc-router sysctl -q -w net.ipv4.ip_forward=1
     trap - EXIT
-    printf 'Lab created: three subnet bridges, six namespaces, internal routing enabled.\n'
+    printf 'Lab created: three subnet bridges, six namespaces, independent subnet routing tables.\n'
 }
 
 status() {
@@ -133,11 +145,17 @@ status() {
         return
     fi
     require_lab
-    local name
+    local name table
     for name in "${NAMESPACES[@]}"; do
         printf '\n%s\n' "$name"
         ip -n "$name" -brief address show
         ip -n "$name" route show
+    done
+    printf '\nvpc-router policy rules\n'
+    ip -n vpc-router rule show
+    for table in 101 102 103; do
+        printf '\nvpc-router table %s\n' "$table"
+        ip -n vpc-router route show table "$table"
     done
 }
 
@@ -145,7 +163,7 @@ check() {
     require_lab
     need ping
     need arping
-    local namespace target
+    local namespace target interface source egress table route
     while read -r namespace target; do
         ip netns exec "$namespace" ping -n -c 1 -W 2 "$target" >/dev/null || die "$namespace cannot reach $target"
         printf 'PASS: %s reaches %s on its own segment\n' "$namespace" "$target"
@@ -178,11 +196,21 @@ ROUTED_PEERS
         fi
         printf 'PASS: public ARP does not reach %s\n' "$target"
     done
-    if ip -n vpc-router route get 203.0.113.10 >/dev/null 2>&1; then
-        die 'Router unexpectedly has an external route'
-    fi
+    while read -r interface source target egress table; do
+        route=$(ip -n vpc-router route get "$target" from "$source" iif "$interface") || die "$interface has no internal route"
+        [[ $route == *"dev $egress table $table"* && $route != *" via "* ]] || die "$interface is not using its direct subnet route in table $table"
+        [[ $(ip -n vpc-router route show table "$table" type unreachable exact default) == 'unreachable default'* ]] || die "$interface is missing its terminal unreachable route"
+        if ip -n vpc-router route get 203.0.113.10 from "$source" iif "$interface" >/dev/null 2>&1; then
+            die "$interface unexpectedly has an external route"
+        fi
+        printf 'PASS: %s uses table %s for internal traffic and rejects external traffic\n' "$interface" "$table"
+    done <<'POLICIES'
+public 10.0.1.10 10.0.2.10 private 101
+private 10.0.2.10 10.0.3.10 isolated 102
+isolated 10.0.3.10 10.0.2.10 private 103
+POLICIES
     [[ $(ip netns exec vpc-router sysctl -n net.ipv4.ip_forward) == 1 ]] || die 'Router forwarding is disabled'
-    printf 'PASS: internal routing works; router has no external route\n'
+    printf 'PASS: internal routing works with separate subnet policies\n'
 }
 
 capture_arp() {

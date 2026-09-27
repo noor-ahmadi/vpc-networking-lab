@@ -74,6 +74,37 @@ for cycle in 1 2; do
     bash ./lab.sh up
     bash ./lab.sh status
     bash ./lab.sh check
+    # A healthy off-VPC destination exists only through the router's main table.
+    ip -n vpc-web address add 203.0.113.10/32 dev lo
+    ip -n vpc-router route add 203.0.113.10/32 via 10.0.1.10 dev public
+    ip netns exec vpc-router ping -n -c 1 -W 2 203.0.113.10 >/dev/null
+    for namespace in vpc-db vpc-app vpc-nat; do
+        if ip netns exec "$namespace" ping -n -c 1 -W 2 203.0.113.10 >/dev/null; then
+            fail "$namespace escaped its subnet policy through the main table"
+        fi
+    done
+    printf 'PASS: subnet policies block a reachable destination in the main table\n'
+
+    if (( cycle == 1 )); then
+        # An explicit private-table route must not grant the database access.
+        ip -n vpc-router route add table 102 203.0.113.10/32 via 10.0.1.10 dev public
+        ip netns exec vpc-app ping -n -c 1 -W 2 203.0.113.10 >/dev/null
+        expect_failure ip netns exec vpc-db ping -n -c 1 -W 2 203.0.113.10
+        ip -n vpc-router route delete table 102 203.0.113.10/32
+        printf 'PASS: a route added to one subnet table stays scoped to that subnet\n'
+
+        # Without the terminal route, a failed lookup falls through to main.
+        ip -n vpc-router route delete table 103 unreachable default
+        ip netns exec vpc-db ping -n -c 1 -W 2 203.0.113.10 >/dev/null
+        expect_failure bash ./lab.sh check
+        ip -n vpc-router route add table 103 unreachable default
+        expect_failure ip netns exec vpc-db ping -n -c 1 -W 2 203.0.113.10
+        printf 'PASS: removing the isolated guard reproduces a leak; restoring it blocks the leak\n'
+    fi
+    bash ./lab.sh check
+    ip -n vpc-router route delete 203.0.113.10/32
+    ip -n vpc-web address delete 203.0.113.10/32 dev lo
+
     # A reply from a different subnet requires forwarding and both host routes.
     ip -n vpc-app neigh flush dev eth0
     ip netns exec vpc-app ping -n -c 1 -W 2 10.0.3.10 >/dev/null
@@ -123,6 +154,14 @@ for cycle in 1 2; do
         ip -n vpc-db route add default via 10.0.3.1 dev eth0
         bash ./lab.sh check
         printf 'PASS: checks detect and recover from a missing database return route\n'
+
+        # Main-table routes still work, but check must notice a missing policy.
+        ip -n vpc-router rule delete priority 102
+        ip netns exec vpc-app ping -n -c 1 -W 2 10.0.3.10 >/dev/null
+        expect_failure bash ./lab.sh check
+        ip -n vpc-router rule add priority 102 iif private lookup 102
+        bash ./lab.sh check
+        printf 'PASS: checks detect and recover from a missing subnet policy rule\n'
     fi
 
     bash ./lab.sh down
@@ -149,4 +188,4 @@ printf 'PASS: replaced namespace is preserved\n'
 ip netns delete vpc-sentinel
 snapshot_host > "$scratch/after"
 diff -u "$scratch/before" "$scratch/after" || fail 'Host network configuration changed'
-printf '\nPASS: two full cycles, ownership guards, ARP, routed traffic and return paths, fault detection, and unchanged host network\n'
+printf '\nPASS: two full cycles, ownership guards, ARP, subnet routing policies and return paths, fault detection, and unchanged host network\n'
