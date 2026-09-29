@@ -11,7 +11,7 @@ expect_failure() {
 (( EUID == 0 )) || fail 'Run in a disposable Linux environment as root'
 [[ ! -e /run/vpc-networking-lab ]] || fail 'A lab already exists'
 [[ ! -e /run/netns/vpc-sentinel ]] || fail 'Test namespace already exists'
-for name in vpc-switch vpc-router vpc-web vpc-nat vpc-app vpc-db; do
+for name in vpc-switch vpc-router vpc-web vpc-nat vpc-app vpc-db vpc-edge vpc-internet; do
     [[ ! -e /run/netns/$name ]] || fail "$name already exists"
 done
 
@@ -64,7 +64,7 @@ expect_failure bash -c '
     exec bash ./lab.sh up
 '
 [[ ! -e /run/vpc-networking-lab ]] || fail 'Failed setup left ownership state behind'
-for name in vpc-switch vpc-router vpc-web vpc-nat vpc-app vpc-db; do
+for name in vpc-switch vpc-router vpc-web vpc-nat vpc-app vpc-db vpc-edge vpc-internet; do
     [[ ! -e /run/netns/$name ]] || fail 'Failed setup left a namespace behind'
 done
 printf 'PASS: partial setup failure rolls back created namespaces\n'
@@ -74,12 +74,13 @@ for cycle in 1 2; do
     bash ./lab.sh up
     bash ./lab.sh status
     bash ./lab.sh check
+    python3 -u tests/traffic.py
     # A healthy off-VPC destination exists only through the router's main table.
-    ip -n vpc-web address add 203.0.113.10/32 dev lo
-    ip -n vpc-router route add 203.0.113.10/32 via 10.0.1.10 dev public
-    ip netns exec vpc-router ping -n -c 1 -W 2 203.0.113.10 >/dev/null
+    ip -n vpc-web address add 192.0.2.10/32 dev lo
+    ip -n vpc-router route add 192.0.2.10/32 via 10.0.1.10 dev public
+    ip netns exec vpc-router ping -n -c 1 -W 2 192.0.2.10 >/dev/null
     for namespace in vpc-db vpc-app vpc-nat; do
-        if ip netns exec "$namespace" ping -n -c 1 -W 2 203.0.113.10 >/dev/null; then
+        if ip netns exec "$namespace" ping -n -c 1 -W 2 192.0.2.10 >/dev/null; then
             fail "$namespace escaped its subnet policy through the main table"
         fi
     done
@@ -87,23 +88,23 @@ for cycle in 1 2; do
 
     if (( cycle == 1 )); then
         # An explicit private-table route must not grant the database access.
-        ip -n vpc-router route add table 102 203.0.113.10/32 via 10.0.1.10 dev public
-        ip netns exec vpc-app ping -n -c 1 -W 2 203.0.113.10 >/dev/null
-        expect_failure ip netns exec vpc-db ping -n -c 1 -W 2 203.0.113.10
-        ip -n vpc-router route delete table 102 203.0.113.10/32
+        ip -n vpc-router route add table 102 192.0.2.10/32 via 10.0.1.10 dev public
+        ip netns exec vpc-app ping -n -c 1 -W 2 192.0.2.10 >/dev/null
+        expect_failure ip netns exec vpc-db ping -n -c 1 -W 2 192.0.2.10
+        ip -n vpc-router route delete table 102 192.0.2.10/32
         printf 'PASS: a route added to one subnet table stays scoped to that subnet\n'
 
         # Without the terminal route, a failed lookup falls through to main.
         ip -n vpc-router route delete table 103 unreachable default
-        ip netns exec vpc-db ping -n -c 1 -W 2 203.0.113.10 >/dev/null
+        ip netns exec vpc-db ping -n -c 1 -W 2 192.0.2.10 >/dev/null
         expect_failure bash ./lab.sh check
         ip -n vpc-router route add table 103 unreachable default
-        expect_failure ip netns exec vpc-db ping -n -c 1 -W 2 203.0.113.10
+        expect_failure ip netns exec vpc-db ping -n -c 1 -W 2 192.0.2.10
         printf 'PASS: removing the isolated guard reproduces a leak; restoring it blocks the leak\n'
     fi
     bash ./lab.sh check
-    ip -n vpc-router route delete 203.0.113.10/32
-    ip -n vpc-web address delete 203.0.113.10/32 dev lo
+    ip -n vpc-router route delete 192.0.2.10/32
+    ip -n vpc-web address delete 192.0.2.10/32 dev lo
 
     # A reply from a different subnet requires forwarding and both host routes.
     ip -n vpc-app neigh flush dev eth0
@@ -166,7 +167,7 @@ for cycle in 1 2; do
 
     bash ./lab.sh down
     bash ./lab.sh down
-    for name in vpc-switch vpc-router vpc-web vpc-nat vpc-app vpc-db; do
+    for name in vpc-switch vpc-router vpc-web vpc-nat vpc-app vpc-db vpc-edge vpc-internet; do
         [[ ! -e /run/netns/$name ]] || fail "$name survived teardown"
     done
     [[ ! -e /run/vpc-networking-lab ]] || fail 'Ownership state survived teardown'
@@ -188,4 +189,4 @@ printf 'PASS: replaced namespace is preserved\n'
 ip netns delete vpc-sentinel
 snapshot_host > "$scratch/after"
 diff -u "$scratch/before" "$scratch/after" || fail 'Host network configuration changed'
-printf '\nPASS: two full cycles, ownership guards, ARP, subnet routing policies and return paths, fault detection, and unchanged host network\n'
+printf '\nPASS: two full cycles, ownership guards, ARP, subnet policies, HTTP, NAT captures and faults, and unchanged host network\n'

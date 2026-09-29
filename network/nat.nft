@@ -1,0 +1,14 @@
+# Only private-subnet outbound traffic may start a forwarded connection.
+table ip vpc_nat {
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+        ct state invalid drop
+        ct state established,related counter accept
+        iifname "eth0" oifname "eth0" ip saddr 10.0.2.0/24 ip daddr 203.0.113.0/24 counter accept
+        counter drop
+    }
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname "eth0" ip saddr 10.0.2.0/24 ip daddr 203.0.113.0/24 counter snat to 10.0.1.20
+    }
+}

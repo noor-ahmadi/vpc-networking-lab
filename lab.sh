@@ -5,7 +5,9 @@ umask 077
 
 readonly STATE=/run/vpc-networking-lab
 readonly NETNS=/run/netns
-readonly -a NAMESPACES=(vpc-switch vpc-router vpc-web vpc-nat vpc-app vpc-db)
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+readonly ROOT
+readonly -a NAMESPACES=(vpc-switch vpc-router vpc-web vpc-nat vpc-app vpc-db vpc-edge vpc-internet)
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null || die "Missing command: $1"; }
@@ -18,8 +20,8 @@ Usage: sudo ./lab.sh {up|down|status|check|arp}
 
   up      Create three subnet segments with independent routing policies.
   down    Remove this lab's namespaces; refuse busy or replaced ones.
-  status  Show interfaces, addresses, routes, and policy rules.
-  check   Verify connectivity, ARP, and subnet routing policies.
+  status  Show addresses, routes, policy rules, and NAT/filter counters.
+  check   Verify internal routing, public access, NAT, and isolated egress.
   arp     Capture an ARP request and reply on the public segment.
 
 Requires Linux and root. See docs/local-lab.md for dependencies and topology.
@@ -92,6 +94,7 @@ connect() {
 }
 
 up() {
+    need nft
     [[ ! -e "$STATE" ]] || die "Lab state already exists; inspect status or run down first"
     local name bridge table
     for name in "${NAMESPACES[@]}"; do
@@ -117,6 +120,20 @@ up() {
     connect vpc-nat eth0 nat br-public 10.0.1.20/24
     connect vpc-app eth0 app br-private 10.0.2.10/24
     connect vpc-db eth0 db br-isolated 10.0.3.10/24
+
+    ip -n vpc-router link add edge type veth peer name vpc netns vpc-edge
+    ip -n vpc-router address add 198.51.100.2/30 dev edge
+    ip -n vpc-edge address add 198.51.100.1/30 dev vpc
+    ip -n vpc-router link set edge up
+    ip -n vpc-edge link set vpc up
+    ip -n vpc-edge link add internet type veth peer name eth0 netns vpc-internet
+    ip -n vpc-edge address add 203.0.113.1/24 dev internet
+    ip -n vpc-edge address add 203.0.113.20/32 dev internet
+    ip -n vpc-edge address add 203.0.113.30/32 dev internet
+    ip -n vpc-internet address add 203.0.113.10/24 dev eth0
+    ip -n vpc-edge link set internet up
+    ip -n vpc-internet link set eth0 up
+
     # Hosts send off-subnet packets to the router; connected routes handle replies.
     ip -n vpc-web route add default via 10.0.1.1 dev eth0
     ip -n vpc-nat route add default via 10.0.1.1 dev eth0
@@ -128,15 +145,35 @@ up() {
         ip -n vpc-router route add table "$table" 10.0.1.0/24 dev public scope link
         ip -n vpc-router route add table "$table" 10.0.2.0/24 dev private scope link
         ip -n vpc-router route add table "$table" 10.0.3.0/24 dev isolated scope link
-        # A missing route would fall through to main; unreachable stops lookup.
-        ip -n vpc-router route add table "$table" unreachable default
     done
+    ip -n vpc-router route add table 101 198.51.100.0/30 dev edge scope link
+    ip -n vpc-router route add table 101 default via 198.51.100.1 dev edge
+    ip -n vpc-router route add table 102 default via 10.0.1.20 dev public
+    # A missing route would fall through to main; unreachable stops lookup.
+    ip -n vpc-router route add table 103 unreachable default
     ip -n vpc-router rule add priority 101 iif public lookup 101
     ip -n vpc-router rule add priority 102 iif private lookup 102
     ip -n vpc-router rule add priority 103 iif isolated lookup 103
-    ip netns exec vpc-router sysctl -q -w net.ipv4.ip_forward=1
+    ip -n vpc-router route add 203.0.113.0/24 via 198.51.100.1 dev edge
+    ip -n vpc-edge route add 10.0.0.0/16 via 198.51.100.2 dev vpc
+    # No external-host route into the VPC: replies must use the public mappings.
+    for name in vpc-router vpc-edge vpc-nat; do
+        ip netns exec "$name" sysctl -q -w net.ipv4.ip_forward=1
+    done
+    # Configure these after forwarding, which resets some IPv4 defaults.
+    for name in "${NAMESPACES[@]}"; do
+        ip netns exec "$name" bash -e <<'SYSCTLS'
+            for interface in /proc/sys/net/ipv4/conf/*; do
+                printf "0\n" > "$interface/send_redirects"
+                printf "0\n" > "$interface/accept_redirects"
+                printf "2\n" > "$interface/rp_filter"
+            done
+SYSCTLS
+    done
+    ip netns exec vpc-nat nft -f "$ROOT/network/nat.nft"
+    ip netns exec vpc-edge nft -f "$ROOT/network/edge.nft"
     trap - EXIT
-    printf 'Lab created: three subnet bridges, six namespaces, independent subnet routing tables.\n'
+    printf 'Lab created: eight namespaces, subnet routing, public mappings, and private NAT.\n'
 }
 
 status() {
@@ -156,6 +193,10 @@ status() {
     for table in 101 102 103; do
         printf '\nvpc-router table %s\n' "$table"
         ip -n vpc-router route show table "$table"
+    done
+    for name in vpc-nat vpc-edge; do
+        printf '\n%s NAT and filter rules\n' "$name"
+        ip netns exec "$name" nft list ruleset
     done
 }
 
@@ -199,18 +240,31 @@ ROUTED_PEERS
     while read -r interface source target egress table; do
         route=$(ip -n vpc-router route get "$target" from "$source" iif "$interface") || die "$interface has no internal route"
         [[ $route == *"dev $egress table $table"* && $route != *" via "* ]] || die "$interface is not using its direct subnet route in table $table"
-        [[ $(ip -n vpc-router route show table "$table" type unreachable exact default) == 'unreachable default'* ]] || die "$interface is missing its terminal unreachable route"
-        if ip -n vpc-router route get 203.0.113.10 from "$source" iif "$interface" >/dev/null 2>&1; then
-            die "$interface unexpectedly has an external route"
-        fi
-        printf 'PASS: %s uses table %s for internal traffic and rejects external traffic\n' "$interface" "$table"
+        printf 'PASS: %s uses table %s for direct internal traffic\n' "$interface" "$table"
     done <<'POLICIES'
 public 10.0.1.10 10.0.2.10 private 101
 private 10.0.2.10 10.0.3.10 isolated 102
 isolated 10.0.3.10 10.0.2.10 private 103
 POLICIES
-    [[ $(ip netns exec vpc-router sysctl -n net.ipv4.ip_forward) == 1 ]] || die 'Router forwarding is disabled'
-    printf 'PASS: internal routing works with separate subnet policies\n'
+    route=$(ip -n vpc-router route get 203.0.113.10 from 10.0.1.10 iif public)
+    [[ $route == *'via 198.51.100.1 dev edge table 101'* ]] || die 'Public traffic does not use the edge'
+    route=$(ip -n vpc-router route get 203.0.113.10 from 10.0.2.10 iif private)
+    [[ $route == *'via 10.0.1.20 dev public table 102'* ]] || die 'Private traffic does not use NAT'
+    [[ $(ip -n vpc-router route show table 103 type unreachable exact default) == 'unreachable default'* ]] || die 'Isolated subnet is missing its terminal unreachable route'
+    if ip -n vpc-router route get 203.0.113.10 from 10.0.3.10 iif isolated >/dev/null 2>&1; then
+        die 'Isolated traffic escaped its routing policy'
+    fi
+    for namespace in vpc-web vpc-app; do
+        ip netns exec "$namespace" ping -n -c 1 -W 2 203.0.113.10 >/dev/null || die "$namespace cannot reach the external fixture"
+    done
+    ip netns exec vpc-internet ping -n -c 1 -W 2 203.0.113.20 >/dev/null || die 'Public web mapping is unreachable'
+    if ip netns exec vpc-db ping -n -c 1 -W 2 203.0.113.10 >/dev/null; then
+        die 'Database reached the healthy external fixture'
+    fi
+    for namespace in vpc-router vpc-edge vpc-nat; do
+        [[ $(ip netns exec "$namespace" sysctl -n net.ipv4.ip_forward) == 1 ]] || die "$namespace forwarding is disabled"
+    done
+    printf 'PASS: public access and private NAT work; isolated external traffic is blocked\n'
 }
 
 capture_arp() {
