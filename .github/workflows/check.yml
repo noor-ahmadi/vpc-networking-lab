@@ -23,4 +23,6 @@ jobs:
           bash -n tests/integration.sh
           shellcheck lab.sh tests/integration.sh
       - name: Exercise the network and cleanup
-        run: sudo bash tests/integration.sh
+        # Runner interfaces can change while the job runs. Keep every snapshot
+        # check in a separate network stack instead of ignoring those changes.
+        run: sudo unshare --net bash tests/integration.sh

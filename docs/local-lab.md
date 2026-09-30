@@ -169,6 +169,11 @@ The suite also compares host interfaces, addresses, routes, routing rules, forwa
 firewall rules before and after. Install `nftables` for this comparison and
 `shellcheck` for shell linting.
 
+CI uses `sudo unshare --net bash tests/integration.sh` to give this comparison
+its own network stack. Runner interfaces can appear during a job; they remain
+outside that stack. The full snapshot comparison still detects changes to the
+test's starting network, and the namespace ownership checks still run.
+
 For an isolated test on a Linux Docker engine, build the tool image, then run
 with networking disabled. Namespace creation requires a privileged container;
 use your local development machine or a disposable runner.
