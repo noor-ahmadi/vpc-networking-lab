@@ -75,6 +75,7 @@ for cycle in 1 2; do
     bash ./lab.sh status
     bash ./lab.sh check
     python3 -u tests/traffic.py
+    python3 -u tests/services.py
     # A healthy off-VPC destination exists only through the router's main table.
     ip -n vpc-web address add 192.0.2.10/32 dev lo
     ip -n vpc-router route add 192.0.2.10/32 via 10.0.1.10 dev public
@@ -189,4 +190,4 @@ printf 'PASS: replaced namespace is preserved\n'
 ip netns delete vpc-sentinel
 snapshot_host > "$scratch/after"
 diff -u "$scratch/before" "$scratch/after" || fail 'Host network configuration changed'
-printf '\nPASS: two full cycles, ownership guards, ARP, subnet policies, HTTP, NAT captures and faults, and unchanged host network\n'
+printf '\nPASS: two full cycles, ownership guards, ARP, subnet policies, services and access rules, NAT captures and faults, and unchanged host network\n'

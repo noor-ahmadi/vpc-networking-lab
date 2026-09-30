@@ -1,0 +1,21 @@
+table ip vpc_workload {
+    counter denied_input {}
+    counter denied_output {}
+    chain input {
+        type filter hook input priority filter; policy drop;
+        ct state invalid drop
+        iifname "lo" accept
+        ct state established,related counter accept
+        ip protocol icmp accept
+        ip saddr 10.0.2.10 tcp dport 5432 counter accept
+        counter name denied_input drop
+    }
+    chain output {
+        type filter hook output priority filter; policy drop;
+        ct state invalid drop
+        oifname "lo" accept
+        ct state established,related counter accept
+        ip protocol icmp accept
+        counter name denied_output drop
+    }
+}

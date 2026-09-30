@@ -20,7 +20,7 @@ Usage: sudo ./lab.sh {up|down|status|check|arp}
 
   up      Create three subnet segments with independent routing policies.
   down    Remove this lab's namespaces; refuse busy or replaced ones.
-  status  Show addresses, routes, policy rules, and NAT/filter counters.
+  status  Show addresses, routes, policy rules, and firewall counters.
   check   Verify internal routing, public access, NAT, and isolated egress.
   arp     Capture an ARP request and reply on the public segment.
 
@@ -172,6 +172,9 @@ SYSCTLS
     done
     ip netns exec vpc-nat nft -f "$ROOT/network/nat.nft"
     ip netns exec vpc-edge nft -f "$ROOT/network/edge.nft"
+    for name in web app db; do
+        ip netns exec "vpc-$name" nft -f "$ROOT/network/$name.nft"
+    done
     trap - EXIT
     printf 'Lab created: eight namespaces, subnet routing, public mappings, and private NAT.\n'
 }
@@ -194,8 +197,8 @@ status() {
         printf '\nvpc-router table %s\n' "$table"
         ip -n vpc-router route show table "$table"
     done
-    for name in vpc-nat vpc-edge; do
-        printf '\n%s NAT and filter rules\n' "$name"
+    for name in vpc-nat vpc-edge vpc-web vpc-app vpc-db; do
+        printf '\n%s firewall rules\n' "$name"
         ip netns exec "$name" nft list ruleset
     done
 }

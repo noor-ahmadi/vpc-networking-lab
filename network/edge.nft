@@ -6,7 +6,8 @@ table ip vpc_edge {
         ct state invalid drop
         ct state established,related counter accept
         iifname "vpc" oifname "internet" ip saddr { 10.0.1.10, 10.0.1.20 } ip daddr 203.0.113.0/24 counter accept
-        iifname "internet" oifname "vpc" ct status dnat ip daddr 10.0.1.10 counter accept
+        iifname "internet" oifname "vpc" ct status dnat ip daddr 10.0.1.10 tcp dport 80 counter accept
+        iifname "internet" oifname "vpc" ct status dnat ip daddr 10.0.1.10 ip protocol icmp counter accept
         counter name denied_forward drop
     }
     chain prerouting {

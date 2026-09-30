@@ -50,15 +50,16 @@ class PeerHandler(BaseHTTPRequestHandler):
         pass
 
 
-def serve(address):
+def serve(address, port):
     # HTTPServer performs a reverse DNS lookup during bind; the lab needs no DNS.
-    with TCPServer((address, PORT), PeerHandler) as server:
+    TCPServer.allow_reuse_address = True
+    with TCPServer((address, port), PeerHandler) as server:
         print("ready", flush=True)
         server.serve_forever()
 
 
-def client(address):
-    connection = HTTPConnection(address, PORT, timeout=2)
+def client(address, port):
+    connection = HTTPConnection(address, port, timeout=2)
     try:
         connection.connect()
         local = connection.sock.getsockname()
@@ -77,9 +78,9 @@ def client(address):
     return 0
 
 
-def request(namespace, address, peer=None, denied=False):
+def request(namespace, address, peer=None, denied=False, port=PORT):
     result = run(namespace, sys.executable, str(Path(__file__).resolve()),
-                 "request", address, check=False)
+                 "request", address, str(port), check=False)
     if denied:
         assert result.returncode == 1, f"Unexpected HTTP result: {result.stdout} {result.stderr}"
         assert "network_error" in json.loads(result.stderr), result.stderr
@@ -91,10 +92,10 @@ def request(namespace, address, peer=None, denied=False):
     return body
 
 
-def start_server(stack, namespace, address):
+def start_server(stack, namespace, address, port=PORT):
     process = subprocess.Popen(
         ["ip", "netns", "exec", namespace, sys.executable, str(Path(__file__).resolve()),
-         "serve", address], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+         "serve", address, str(port)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     stack.callback(process.stdout.close)
     stack.callback(process.stderr.close)
@@ -103,7 +104,7 @@ def start_server(stack, namespace, address):
         selector.register(process.stdout, selectors.EVENT_READ)
         assert selector.select(timeout=5), f"{namespace} HTTP fixture did not start"
         assert process.stdout.readline().strip() == "ready", f"{namespace} HTTP fixture failed"
-    request(namespace, address, peer=address)
+    request(namespace, address, peer=address, port=port)
 
 
 def capture_nat():
@@ -168,25 +169,25 @@ def test_traffic():
     subprocess.run(["bash", str(ROOT / "lab.sh"), "status"], check=True,
                    stdout=subprocess.DEVNULL, timeout=10)
     with ExitStack() as stack:
-        for namespace, address in [
-            ("vpc-internet", OUTSIDE), ("vpc-web", "10.0.1.10"),
-            ("vpc-app", "10.0.2.10"), ("vpc-db", "10.0.3.10"),
-            ("vpc-nat", "10.0.1.20"),
+        for namespace, address, port in [
+            ("vpc-internet", OUTSIDE, PORT), ("vpc-web", "10.0.1.10", 80),
+            ("vpc-app", "10.0.2.10", 8080), ("vpc-db", "10.0.3.10", 5432),
+            ("vpc-nat", "10.0.1.20", PORT),
         ]:
-            start_server(stack, namespace, address)
+            start_server(stack, namespace, address, port)
 
         # A missing return route makes any untranslated private source unusable.
         result = run("vpc-internet", "ip", "route", "get", "10.0.2.10", check=False)
         assert result.returncode != 0, "External fixture has a VPC return route"
         request("vpc-web", OUTSIDE, peer="203.0.113.20")
-        request("vpc-internet", "203.0.113.20", peer=OUTSIDE)
+        request("vpc-internet", "203.0.113.20", peer=OUTSIDE, port=80)
         capture_nat()
         request("vpc-db", OUTSIDE, denied=True)
-        request("vpc-app", "10.0.3.10", peer="10.0.2.10")
+        request("vpc-app", "10.0.3.10", peer="10.0.2.10", port=5432)
         print("PASS: public HTTP works in both directions; isolated egress is denied")
 
-        # A healthy NAT-local server is reachable internally, but not via its public mapping.
-        request("vpc-web", "10.0.1.20", peer="10.0.1.10")
+        # Verify the NAT-local listener before testing its blocked public mapping.
+        request("vpc-nat", "10.0.1.20", peer="10.0.1.20")
         before = denied_count()
         request("vpc-internet", "203.0.113.30", denied=True)
         assert denied_count() > before, "NAT ingress failed without reaching the edge filter"
@@ -194,9 +195,9 @@ def test_traffic():
         # Deliberately supply an attacker-side route: the edge must still reject direct ingress.
         run("vpc-internet", "ip", "route", "add", "10.0.0.0/16", "via", "203.0.113.1")
         try:
-            for address in ("10.0.1.10", "10.0.2.10", "10.0.3.10"):
+            for address, port in (("10.0.1.10", 80), ("10.0.2.10", 8080), ("10.0.3.10", 5432)):
                 before = denied_count()
-                request("vpc-internet", address, denied=True)
+                request("vpc-internet", address, denied=True, port=port)
                 assert denied_count() > before, "Direct ingress did not hit the edge filter"
         finally:
             run("vpc-internet", "ip", "route", "delete", "10.0.0.0/16")
@@ -205,7 +206,7 @@ def test_traffic():
         run("vpc-nat", "ip", "link", "set", "eth0", "down")
         try:
             request("vpc-app", OUTSIDE, denied=True)
-            request("vpc-app", "10.0.3.10", peer="10.0.2.10")
+            request("vpc-app", "10.0.3.10", peer="10.0.2.10", port=5432)
             request("vpc-web", OUTSIDE, peer="203.0.113.20")
         finally:
             run("vpc-nat", "ip", "link", "set", "eth0", "up")
@@ -222,7 +223,7 @@ def test_traffic():
             try:
                 request("vpc-internet", OUTSIDE, peer=OUTSIDE)
                 request("vpc-app", OUTSIDE, denied=True)
-                request("vpc-app", "10.0.3.10", peer="10.0.2.10")
+                request("vpc-app", "10.0.3.10", peer="10.0.2.10", port=5432)
             finally:
                 run(namespace, "nft", "-f", "-", input=(
                     f"delete table ip {table}\n" + (ROOT / "network" / filename).read_text()))
@@ -231,10 +232,10 @@ def test_traffic():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] == "serve":
-        serve(sys.argv[2])
-    elif len(sys.argv) == 3 and sys.argv[1] == "request":
-        sys.exit(client(sys.argv[2]))
+    if len(sys.argv) == 4 and sys.argv[1] == "serve":
+        serve(sys.argv[2], int(sys.argv[3]))
+    elif len(sys.argv) == 4 and sys.argv[1] == "request":
+        sys.exit(client(sys.argv[2], int(sys.argv[3])))
     elif len(sys.argv) == 1:
         try:
             test_traffic()
