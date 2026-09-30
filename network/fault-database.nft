@@ -1,0 +1,8 @@
+# Keep the workload's stateful policy intact; deny new app database requests.
+table ip vpc_fault {
+    counter denied_database {}
+    chain input {
+        type filter hook input priority -10; policy accept;
+        ct state new ip saddr 10.0.2.10 tcp dport 5432 counter name denied_database drop
+    }
+}

@@ -5,12 +5,14 @@ from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
+import re
 import selectors
 import subprocess
 import sys
 import tempfile
+import time
 
-from traffic import OUTSIDE, ROOT, denied_count, request, run, start_server, stop
+from traffic import OUTSIDE, ROOT, denied_count, lab, report_fault, request, run, start_server, stop
 
 
 def http(namespace, address, port, path, status=200):
@@ -21,8 +23,8 @@ def http(namespace, address, port, path, status=200):
     return response["body"]
 
 
-def counter(namespace, name):
-    result = run(namespace, "nft", "-j", "list", "counter", "ip", "vpc_workload", name)
+def counter(namespace, name, table="vpc_workload"):
+    result = run(namespace, "nft", "-j", "list", "counter", "ip", table, name)
     return next(item["counter"]["packets"] for item in json.loads(result.stdout)["nftables"]
                 if "counter" in item)
 
@@ -34,6 +36,49 @@ def tcp_denied(namespace, address, port, filter_namespace, name):
                  f"socket.create_connection(('{address}', {port}), timeout=2)", check=False)
     assert result.returncode != 0 and "TimeoutError" in result.stderr, result
     assert counter(filter_namespace, name) > before, "Connection failed without hitting the filter"
+
+
+def capture_return_fault():
+    syn = "tcp dst port 5432 and src host 10.0.2.10 and dst host 10.0.3.10 and tcp[13] & 18 == 2"
+    reply = "tcp src port 5432 and src host 10.0.3.10 and dst host 10.0.2.10 and tcp[13] & 18 == 18"
+    points = [("vpc-app", "out", syn), ("vpc-db", "out", reply), ("vpc-app", "in", reply)]
+    with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+        captures = []
+        for index, (namespace, direction, packet_filter) in enumerate(points):
+            packets = Path(directory) / f"{index}.packets"
+            errors = Path(directory) / f"{index}.stderr"
+            process = subprocess.Popen(
+                ["ip", "netns", "exec", namespace, "timeout", "-k", "1", "5",
+                 "tcpdump", "-nn", "-l", "-i", "eth0", "-Q", direction, "-c", "1", packet_filter],
+                stdout=stack.enter_context(packets.open("w")),
+                stderr=stack.enter_context(errors.open("w")),
+            )
+            stack.callback(stop, process)
+            captures.append((process, packets, errors))
+        deadline = time.monotonic() + 3
+        while not all("listening on" in errors.read_text() for _, _, errors in captures):
+            assert time.monotonic() < deadline, "Return-path captures did not become ready"
+            assert all(process.poll() is None for process, *_ in captures), "Packet capture exited early"
+            time.sleep(0.02)
+        before = counter("vpc-router", "denied_return", "vpc_fault")
+        assert http("vpc-internet", "203.0.113.20", 80, "/health")["status"] == "ok"
+        assert http("vpc-internet", "203.0.113.20", 80, "/message", status=503)["error"] == "database unavailable"
+        after = counter("vpc-router", "denied_return", "vpc_fault")
+        assert after > before, "Reply failure did not hit the stateless filter"
+        observed = []
+        for index, (process, packets, errors) in enumerate(captures):
+            expected_exit = 124 if index == 2 else 0
+            assert process.wait(timeout=6) == expected_exit, errors.read_text()
+            observed.append(packets.read_text().strip())
+        source_port = re.search(r"IP 10\.0\.2\.10\.(\d+) > 10\.0\.3\.10\.5432: Flags \[S\]", observed[0])
+        assert source_port, observed[0]
+        port = int(source_port.group(1))
+        assert 1024 <= port <= 65535, port
+        assert f"IP 10.0.3.10.5432 > 10.0.2.10.{port}: Flags [S.]" in observed[1], observed[1]
+        assert not observed[2], f"Blocked reply reached the app: {observed[2]}"
+        print(f"PACKET app outgoing: {observed[0]}")
+        print(f"PACKET database outgoing: {observed[1]}")
+        print(f"PACKET app incoming: no SYN-ACK during the 5-second capture; denied_return {before} -> {after}")
 
 
 def test_services():
@@ -102,20 +147,56 @@ def test_services():
         request("vpc-app", OUTSIDE, peer="203.0.113.30")
         print("PASS: the proxy/app/PostgreSQL path survives lost NAT while private external HTTP fails and recovers")
 
-        # Drop a fresh database connection before the established-state rule.
-        run("vpc-db", "nft", "insert", "rule", "ip", "vpc_workload", "input",
-            "ip", "saddr", "10.0.2.10", "tcp", "dport", "5432",
-            "counter", "name", "denied_input", "drop")
+        started = time.monotonic()
+        lab("fault", "private-route")
         try:
-            before = counter("vpc-db", "denied_input")
+            lab("fault", "private-route")
+            assert "unreachable default" in run("vpc-router", "ip", "route", "show", "table", "102").stdout
+            lookup = run("vpc-router", "ip", "route", "get", OUTSIDE,
+                         "from", "10.0.2.10", "iif", "private", check=False)
+            assert lookup.returncode != 0, lookup
+            print(f"ROUTE private to {OUTSIDE}: {lookup.stderr.strip()}")
+            request("vpc-internet", OUTSIDE, peer=OUTSIDE)
+            request("vpc-app", OUTSIDE, denied=True)
+            request("vpc-web", OUTSIDE, peer="203.0.113.20")
+            assert http("vpc-internet", "203.0.113.20", 80, "/message")["message"] == "A fresh database value"
+        finally:
+            lab("repair", "private-route")
+            lab("repair", "private-route")
+        request("vpc-app", OUTSIDE, peer="203.0.113.30")
+        print("PASS: a missing private default rejects egress without main-table fallback; public HTTP and database queries survive; repair restores egress")
+        report_fault("private-route", "vpc-app 10.0.2.10", f"{OUTSIDE}:8080", started,
+                     "table 102 unreachable default; failed route lookup above; fresh HTTP after repair")
+
+        started = time.monotonic()
+        lab("fault", "database")
+        try:
+            lab("fault", "database")
+            before = counter("vpc-db", "denied_database", "vpc_fault")
             assert http("vpc-internet", "203.0.113.20", 80, "/health")["status"] == "ok"
             assert http("vpc-internet", "203.0.113.20", 80, "/message", status=503)["error"] == "database unavailable"
-            assert counter("vpc-db", "denied_input") > before, "Database fault did not reach the filter"
+            assert counter("vpc-db", "denied_database", "vpc_fault") > before, "Database fault did not reach the filter"
         finally:
-            run("vpc-db", "nft", "-f", "-", input=(
-                "delete table ip vpc_workload\n" + (ROOT / "network/db.nft").read_text()))
+            lab("repair", "database")
+            lab("repair", "database")
         assert http("vpc-internet", "203.0.113.20", 80, "/message")["message"] == "A fresh database value"
         print("PASS: denying app-to-database TCP leaves health up, returns HTTP 503, and recovers after repair")
+        report_fault("database", "vpc-app 10.0.2.10", "10.0.3.10:5432", started,
+                     "vpc-db denied_database increases; /health 200 and /message 503; fresh database value after repair")
+
+        started = time.monotonic()
+        lab("fault", "return-ports")
+        try:
+            lab("fault", "return-ports")
+            capture_return_fault()
+        finally:
+            lab("repair", "return-ports")
+            lab("repair", "return-ports")
+        assert http("vpc-internet", "203.0.113.20", 80, "/message")["message"] == "A fresh database value"
+        assert run("vpc-router", "nft", "list", "table", "ip", "vpc_fault", check=False).returncode != 0
+        print("PASS: stateless reply filtering loses SYN-ACKs to the app's ephemeral port; health stays up and database queries recover after repair")
+        report_fault("return-ports", "vpc-db 10.0.3.10:5432", "vpc-app 10.0.2.10 ephemeral TCP port", started,
+                     "matched SYN/SYN-ACK captures and denied_return above; no delivered SYN-ACK; fresh query after repair")
 
     for namespace in ("vpc-web", "vpc-app", "vpc-db"):
         pids = subprocess.run(["ip", "netns", "pids", namespace],

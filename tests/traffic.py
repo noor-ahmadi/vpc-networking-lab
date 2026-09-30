@@ -19,6 +19,21 @@ OUTSIDE = "203.0.113.10"
 PORT = 8080
 
 
+def lab(*command):
+    return subprocess.run(["bash", str(ROOT / "lab.sh"), *command],
+                          capture_output=True, text=True, timeout=10, check=True)
+
+
+def report_fault(name, source, destination, started, evidence):
+    # Emit only after the fault and its repair have both passed their assertions.
+    print("RESULT: " + json.dumps({
+        "case": name, "source": source, "destination": destination,
+        "expected": "denied during fault; reachable after repair",
+        "observed": "denied during fault; reachable after repair",
+        "duration_seconds": round(time.monotonic() - started, 3), "evidence": evidence,
+    }))
+
+
 def run(namespace, *command, check=True, input=None):
     return subprocess.run(
         ["ip", "netns", "exec", namespace, *command],
@@ -219,16 +234,34 @@ def test_traffic():
             ("vpc-nat", "vpc_nat", "nat.nft"),
             ("vpc-edge", "vpc_edge", "edge.nft"),
         ]:
-            run(namespace, "nft", "flush", "chain", "ip", table, "postrouting")
+            started = time.monotonic()
+            if namespace == "vpc-nat":
+                lab("fault", "nat-snat")
+            else:
+                run(namespace, "nft", "flush", "chain", "ip", table, "postrouting")
             try:
+                if namespace == "vpc-nat":
+                    lab("fault", "nat-snat")
+                    assert "snat to" not in run(namespace, "nft", "list", "chain", "ip", table, "postrouting").stdout
+                    request("vpc-web", OUTSIDE, peer="203.0.113.20")
+                    before = denied_count()
                 request("vpc-internet", OUTSIDE, peer=OUTSIDE)
                 request("vpc-app", OUTSIDE, denied=True)
+                if namespace == "vpc-nat":
+                    assert denied_count() > before, "Untranslated private traffic did not hit the edge filter"
                 request("vpc-app", "10.0.3.10", peer="10.0.2.10", port=5432)
             finally:
-                run(namespace, "nft", "-f", "-", input=(
-                    f"delete table ip {table}\n" + (ROOT / "network" / filename).read_text()))
+                if namespace == "vpc-nat":
+                    lab("repair", "nat-snat")
+                    lab("repair", "nat-snat")
+                else:
+                    run(namespace, "nft", "-f", "-", input=(
+                        f"delete table ip {table}\n" + (ROOT / "network" / filename).read_text()))
             request("vpc-app", OUTSIDE, peer="203.0.113.30")
             print(f"PASS: removing {namespace} SNAT breaks new HTTP flows; restoring it repairs them")
+            if namespace == "vpc-nat":
+                report_fault("nat-snat", "vpc-app 10.0.2.10", f"{OUTSIDE}:{PORT}", started,
+                             "empty vpc_nat postrouting chain; vpc_edge denied_forward increases; HTTP peer after repair")
 
 
 if __name__ == "__main__":
