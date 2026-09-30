@@ -8,6 +8,9 @@ and a separate NAT namespace provides private outbound access. Nginx calls
 a private Python app, which queries PostgreSQL in the isolated subnet.
 The AWS deployment is still to come.
 
+The [failure exercises](failures.md) provide named faults, diagnosis commands,
+and repairs for forwarding, private egress, SNAT, database access, and reply ports.
+
 | Segment | Bridge in `vpc-switch` | Namespace interfaces |
 | --- | --- | --- |
 | Public | `br-public` | `vpc-router` 10.0.1.1, `vpc-web` 10.0.1.10, `vpc-nat` 10.0.1.20 |
@@ -223,7 +226,13 @@ deny counters. A live listener on an unused web port proves external rejection
 at the edge rather than failure from a closed port. It also verifies that the
 full database path survives a lost NAT interface, and that a deliberate
 app-to-database drop returns 503 while health stays up, then recovers after
-the rule is restored. All demo processes exit before namespace teardown.
+repair. Removing the private NAT default rejects egress without falling
+through to `main`, while public HTTP and database queries survive. A separate
+stateless router filter drops PostgreSQL replies to the app's ephemeral port:
+simultaneous captures show the app SYN, the database SYN-ACK, and no delivered
+SYN-ACK, with an increasing router drop counter. A fresh query succeeds after
+repair. Named fault results include source, destination, outcome, elapsed
+seconds, and evidence. All demo processes exit before namespace teardown.
 An injected Nginx startup failure also checks that the launcher stops the app
 and database and removes its temporary files before exiting.
 
