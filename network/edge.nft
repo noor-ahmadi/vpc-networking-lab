@@ -1,0 +1,22 @@
+# Explicit public mappings; never translate arbitrary VPC sources.
+table ip vpc_edge {
+    counter denied_forward {}
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+        ct state invalid drop
+        ct state established,related counter accept
+        iifname "vpc" oifname "internet" ip saddr { 10.0.1.10, 10.0.1.20 } ip daddr 203.0.113.0/24 counter accept
+        iifname "internet" oifname "vpc" ct status dnat ip daddr 10.0.1.10 counter accept
+        counter name denied_forward drop
+    }
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+        iifname "internet" ip daddr 203.0.113.20 counter dnat to 10.0.1.10
+        iifname "internet" ip daddr 203.0.113.30 counter dnat to 10.0.1.20
+    }
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname "internet" ip saddr 10.0.1.10 counter snat to 203.0.113.20
+        oifname "internet" ip saddr 10.0.1.20 counter snat to 203.0.113.30
+    }
+}
