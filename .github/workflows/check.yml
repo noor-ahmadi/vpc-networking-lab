@@ -10,7 +10,7 @@ permissions:
 jobs:
   linux:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Install networking tools
@@ -21,8 +21,15 @@ jobs:
         run: |
           bash -n lab.sh
           bash -n tests/integration.sh
-          shellcheck lab.sh tests/integration.sh
+          bash -n tests/aws.sh
+          shellcheck lab.sh tests/integration.sh tests/aws.sh
       - name: Exercise the network and cleanup
         # Runner interfaces can change while the job runs. Keep every snapshot
         # check in a separate network stack instead of ignoring those changes.
         run: sudo unshare --net bash tests/integration.sh
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.16.5
+          terraform_wrapper: false
+      - name: Check AWS definition without deploying
+        run: bash tests/aws.sh
