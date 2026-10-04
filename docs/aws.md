@@ -1,16 +1,21 @@
-# AWS definition
+# AWS reproduction
 
 The flat configuration in [aws/](../aws) defines the cloud version of the
 local lab. Terraform 1.16.5 and AWS provider 6.67.0 are pinned. Configuration
-tests and rendered startup scripts are checked locally and in CI. Deployment,
-EC2 startup, live traffic, and cloud teardown are still to be verified.
+tests and rendered startup scripts are checked locally and in CI. A live
+deployment in Ohio passed startup, service, NAT, database isolation, and
+inventory-based teardown checks on October 4, 2026. See the
+[recorded reproduction](../evidence/aws-reproduction-2026-10-04.md).
 
 ## Topology and access
 
 One VPC (`10.0.0.0/16`) contains three explicitly associated subnet route
-tables in one AZ, provisionally `us-east-2a`. The implicit main table stays
-local-only. Automatic public addressing is disabled on every subnet and EC2
-instance. Exactly two Elastic IPs provide the web and NAT public mappings.
+tables in `us-east-2a`. The implicit main table stays local-only. Automatic
+public addressing is disabled on every subnet and explicitly disabled on the
+private instances. Web inherits its subnet's setting; its provider-computed
+address flag becomes true when the separately managed EIP attaches. Leaving
+that web flag unset avoids a replacement on the next refresh. Exactly two
+Elastic IPs provide the web and NAT public mappings.
 
 | Workload | Private address | External route | New service ingress |
 | --- | --- | --- | --- |
@@ -36,7 +41,8 @@ single-AZ demonstration, with a private HTTP app and TCP/SCRAM database path.
 
 ## Verify without an AWS account
 
-With the pinned Terraform version, Python 3, Bash, and ShellCheck installed:
+With the pinned Terraform version, Python 3, Bash, ShellCheck, and Ubuntu's
+PostgreSQL 16 / `postgresql-common` tools installed:
 
 ```sh
 bash tests/aws.sh
@@ -47,8 +53,11 @@ The mock `apply` operations create in-memory test state, with no cloud API
 changes. Six runs check final topology/access, temporary bootstrap access,
 its removal while retaining the DB instance, and rejected client/password/AZ
 inputs. Startup scripts for all three roles are rendered with dummy inputs and
-checked with Bash and ShellCheck. These checks establish configuration intent;
-they do not establish that an EC2 machine booted or that AWS traffic succeeded.
+checked with Bash and ShellCheck. The native PostgreSQL parser rejects the
+old unquoted address and reads the rendered drop-in configuration. Offline
+cleanup cases reject live resources, wrong accounts, and AWS read errors.
+These checks establish configuration intent; they do not establish that an
+EC2 machine booted or that AWS traffic succeeded.
 
 ## Prepare a real plan
 
@@ -124,27 +133,73 @@ Host vpc-lab-proxy
     HostName <proxy_ip output>
     User ubuntu
     IdentityFile ~/.ssh/vpc-lab
+    UserKnownHostsFile ~/.ssh/vpc-lab-known-hosts
+    StrictHostKeyChecking yes
+    IdentitiesOnly yes
+    ForwardAgent no
 
 Host vpc-lab-app
     HostName 10.0.2.10
     User ubuntu
     IdentityFile ~/.ssh/vpc-lab
     ProxyJump vpc-lab-proxy
+    UserKnownHostsFile ~/.ssh/vpc-lab-known-hosts
+    StrictHostKeyChecking yes
+    IdentitiesOnly yes
+    ForwardAgent no
 
 Host vpc-lab-db
     HostName 10.0.3.10
     User ubuntu
     IdentityFile ~/.ssh/vpc-lab
     ProxyJump vpc-lab-proxy
+    UserKnownHostsFile ~/.ssh/vpc-lab-known-hosts
+    StrictHostKeyChecking yes
+    IdentitiesOnly yes
+    ForwardAgent no
 ```
 
-No agent forwarding or private-key upload is required. ProxyJump permits the
-SSH control channel only; it does not grant the web service TCP 5432 access.
-Query the proxy from the configured client, then execute app HTTP/HTTPS and
-database checks on their respective hosts. For NAT proof, compare an external
-endpoint's observed source with the `nat_ip` output. Keep those live results
-separate from the sealed Linux fixture. A custom NACL and cloud fault/capture
-automation follow the first verified deployment.
+Save these aliases in a local SSH config. Before connecting, compare each
+scanned Ed25519 host key's SHA256 fingerprint with its authenticated EC2
+console output (`aws ec2 get-console-output --instance-id ... --latest`).
+The AWS CLI decodes the console text. Private host keys can be scanned from
+the already verified proxy. Add only matching keys to the separate known
+hosts file; a replacement requires a new comparison. No agent forwarding or
+private-key upload is required. ProxyJump permits the SSH control channel
+only; it does not grant the web service TCP 5432 access.
+
+On Windows, Git's OpenSSH worked with the Ubuntu image used here. Its
+ProxyJump child requires a POSIX shell; set `SHELL=/usr/bin/sh` and put Git's
+`usr/bin` ahead of Windows OpenSSH on `PATH` for the verification process.
+Use forward slashes in absolute Windows paths in SSH config and in an AWS
+`credential_process` executable path.
+
+## Check the live deployment
+
+Save the inventory before isolation or any replacement, and retain older
+inventories until teardown. After applying the isolation plan:
+
+```sh
+terraform -chdir=aws output -json resource_inventory > aws/inventory.private.json
+python3 aws/check.py traffic --inventory aws/inventory.private.json \
+  --profile <your AWS profile> --ssh-config <your local SSH config>
+```
+
+This verifies the inventory's account, routes, NAT mapping, private addressing,
+exact security rules, and permissive default NACL before exercising traffic.
+It checks both proxy endpoints, web/app reachability, app HTTP/HTTPS source
+addresses matching the NAT EIP, and blocked new web/database, database/app,
+and database/external connections. The external check uses an IP just reached
+from app. An unused public port is checked against a temporary healthy web
+listener, stopped in `finally` with a 30-second service deadline as a fallback.
+SSH keys must already be pinned; the helper never accepts unknown keys.
+
+Blocked checks use two-second connection timeouts and independently healthy
+targets. They establish the observed access matrix alongside AWS policy;
+they do not identify the exact packet-drop location. The reproduction also
+changed the seed row, observed the new value through the proxy, restored it,
+and captured web/app/database TCP headers on app. Managed NAT internals were
+not captured. Custom NACLs and repeatable cloud faults remain next.
 
 ## Cost and destruction
 
@@ -154,6 +209,10 @@ processing and transfer. The full estimate also needs three regional Linux
 `t3.micro` prices and 24 GiB of gp3 storage. Recheck those with the
 [AWS calculator](https://calculator.aws/) for the planned runtime; the network
 floor is not a complete estimate or a spending cap. NAT partial hours round up.
+The October 4 regional API rates gave about **$0.089/hour** for the fixed
+footprint, using 730 hours/month to normalize disk storage. Data processing,
+transfer, taxes, and billing rounding are additional; the recorded run did
+not inspect the final bill.
 
 Before destroy, save the `resource_inventory` output privately. It includes
 instance and root-volume IDs, both EIP allocation IDs, the NAT, IGW, and VPC:
@@ -164,9 +223,18 @@ terraform -chdir=aws plan -destroy -var-file=local.tfvars -out=destroy.tfplan
 terraform -chdir=aws apply destroy.tfplan
 ```
 
-The inventory file is ignored. Use the saved IDs and AWS APIs to verify
-terminated instances, deleted volumes, deleted NAT, released EIPs, and removed
-IGW/VPC after destroy. NAT deletion can take several minutes. A successful
-Terraform command or an empty local state alone is not a cloud cleanup check.
-Preserve the state and inventory if creation or destruction partially fails;
-stopping instances leaves other billable resources in place.
+The ignored inventory includes the account, region, public mappings, instance
+and root-volume IDs, both EIP allocation IDs, the NAT, IGW, and VPC. Verify
+each saved inventory, including those from before host replacements:
+
+```sh
+python3 aws/check.py destroyed --inventory aws/inventory.private.json \
+  --profile <your AWS profile>
+```
+
+The helper checks every resource ID separately, accepts only the corresponding
+not-found error or terminal state, and fails on wrong-account, authentication,
+permission, or malformed-ID errors. NAT deletion can take several minutes.
+A successful Terraform command or an empty local state alone is not a cloud
+cleanup check. Preserve the state and inventories if creation or destruction
+partially fails; stopping instances leaves other billable resources in place.
