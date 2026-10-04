@@ -21,6 +21,12 @@ override_resource {
   values = { id = "sg-00000000000000003" }
 }
 
+# The real provider reports this computed flag true after the web EIP attaches.
+override_resource {
+  target = aws_instance.workload["web"]
+  values = { associate_public_ip_address = true }
+}
+
 variables {
   ami_id             = "ami-00000000000000001"
   operator_cidr      = "198.51.100.10/32"
@@ -68,7 +74,7 @@ run "isolated_topology" {
       aws_instance.workload["app"].private_ip == "10.0.2.10" &&
       aws_instance.workload["db"].private_ip == "10.0.3.10" &&
       alltrue([for role, instance in aws_instance.workload :
-        !instance.associate_public_ip_address && instance.ami == var.ami_id &&
+        (role == "web" || !instance.associate_public_ip_address) && instance.ami == var.ami_id &&
         instance.subnet_id == aws_subnet.lab[local.workloads[role].subnet].id &&
         instance.metadata_options[0].http_tokens == "required" &&
         instance.root_block_device[0].encrypted && instance.root_block_device[0].delete_on_termination &&

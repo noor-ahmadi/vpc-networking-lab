@@ -111,12 +111,14 @@ resource "aws_key_pair" "operator" {
 }
 
 resource "aws_instance" "workload" {
-  for_each                    = local.workloads
-  ami                         = var.ami_id
-  instance_type               = "t3.micro"
-  subnet_id                   = aws_subnet.lab[each.value.subnet].id
-  private_ip                  = each.value.ip
-  associate_public_ip_address = false
+  for_each      = local.workloads
+  ami           = var.ami_id
+  instance_type = "t3.micro"
+  subnet_id     = aws_subnet.lab[each.value.subnet].id
+  private_ip    = each.value.ip
+  # Web inherits disabled subnet auto-addressing; this computed flag becomes
+  # true when its separately managed EIP is attached.
+  associate_public_ip_address = each.key == "web" ? null : false
   vpc_security_group_ids      = [aws_security_group.workload[each.key].id]
   key_name                    = aws_key_pair.operator.key_name
   user_data                   = local.user_data[each.key]

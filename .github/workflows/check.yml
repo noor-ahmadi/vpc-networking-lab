@@ -22,7 +22,8 @@ jobs:
           bash -n lab.sh
           bash -n tests/integration.sh
           bash -n tests/aws.sh
-          shellcheck lab.sh tests/integration.sh tests/aws.sh
+          bash -n tests/aws_postgres.sh
+          shellcheck lab.sh tests/integration.sh tests/aws.sh tests/aws_postgres.sh
       - name: Exercise the network and cleanup
         # Runner interfaces can change while the job runs. Keep every snapshot
         # check in a separate network stack instead of ignoring those changes.

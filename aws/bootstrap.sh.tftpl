@@ -38,8 +38,9 @@ chmod 644 /etc/nginx/sites-available/vpc-lab
 rm -f /etc/nginx/sites-enabled/default
 ln -sf /etc/nginx/sites-available/vpc-lab /etc/nginx/sites-enabled/vpc-lab
 nginx -t
-systemctl enable --now nginx
-systemctl reload nginx
+# A reload cannot rebind the package's existing wildcard listener to this IP.
+systemctl enable nginx
+systemctl restart nginx
 %{ endif ~}
 %{ if role == "app" ~}
 install -d -m 755 /opt/vpc-lab
@@ -71,13 +72,15 @@ systemctl daemon-reload
 systemctl enable --now vpc-app.service
 %{ endif ~}
 %{ if role == "db" ~}
-pg_conftool 16 main set listen_addresses '10.0.3.10'
-pg_conftool 16 main set password_encryption 'scram-sha-256'
+cat > /etc/postgresql/16/main/conf.d/vpc-lab.conf <<'PGCONFIG'
+listen_addresses = '10.0.3.10'
+password_encryption = 'scram-sha-256'
+PGCONFIG
 cat > /etc/postgresql/16/main/pg_hba.conf <<'HBA'
 local all postgres peer
 host vpc_lab vpc_app 10.0.2.10/32 scram-sha-256
 HBA
-chown postgres:postgres /etc/postgresql/16/main/pg_hba.conf
+chown postgres:postgres /etc/postgresql/16/main/pg_hba.conf /etc/postgresql/16/main/conf.d/vpc-lab.conf
 systemctl restart postgresql@16-main
 runuser -u postgres -- psql -v ON_ERROR_STOP=1 <<'SQL'
 CREATE ROLE vpc_app LOGIN PASSWORD '${db_password}';

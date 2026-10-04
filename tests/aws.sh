@@ -31,4 +31,5 @@ for role in web app db; do
     bash -n "$scratch/$role.sh"
     shellcheck "$scratch/$role.sh"
 done
+bash tests/aws_postgres.sh "$scratch/db.sh"
 printf 'PASS: Terraform contracts and three rendered startup scripts\n'
