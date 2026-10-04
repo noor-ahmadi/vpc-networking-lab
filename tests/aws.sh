@@ -2,6 +2,8 @@
 set -Eeuo pipefail
 cd "$(dirname "$0")/.."
 
+python3 tests/aws_check.py
+
 terraform -chdir=aws fmt -check -recursive
 terraform -chdir=aws init -backend=false -input=false -lockfile=readonly
 terraform -chdir=aws validate

@@ -17,7 +17,10 @@ output "instance_ids" {
 output "resource_inventory" {
   description = "Save privately before destroy, then verify these IDs were removed."
   value = {
+    account_id          = data.aws_caller_identity.operator.account_id
     region              = var.region
+    proxy_ip            = aws_eip.lab["web"].public_ip
+    nat_ip              = aws_eip.lab["nat"].public_ip
     vpc_id              = aws_vpc.lab.id
     internet_gateway_id = aws_internet_gateway.lab.id
     nat_gateway_id      = aws_nat_gateway.lab.id
