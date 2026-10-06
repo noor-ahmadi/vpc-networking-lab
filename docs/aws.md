@@ -199,7 +199,10 @@ targets. They establish the observed access matrix alongside AWS policy;
 they do not identify the exact packet-drop location. The reproduction also
 changed the seed row, observed the new value through the proxy, restored it,
 and captured web/app/database TCP headers on app. Managed NAT internals were
-not captured. Custom NACLs and repeatable cloud faults remain next.
+not captured. [AWS faults and repairs](aws-failures.md) now exercise a missing
+private default, a database security-group port change, and a custom NACL's
+missing return rule. They restore the permissive default NACL afterward;
+the ordinary traffic checker retains that baseline contract.
 
 ## Cost and destruction
 
