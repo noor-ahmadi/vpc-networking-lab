@@ -5,10 +5,12 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from aws.check import Lab, permission_rules  # noqa: E402
+from aws.faults import Faults, handshakes, reply_drop  # noqa: E402
 
 
 inventory = {
@@ -105,4 +107,75 @@ for change in ({"IpProtocol": "-1"}, {"ToPort": 65535}, {"Ipv6Ranges": [{"CidrIp
         pass
     else:
         raise AssertionError("Broad security rule was accepted")
-print("PASS: per-ID teardown, wrong-account/read-error rejection, and narrow security rules")
+with patch("aws.check.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")):
+    assert Lab(inventory, "offline").aws("ec2", "delete-route") == {}, "Successful void AWS responses are valid"
+
+request = "IP 10.0.2.10.40123 > 10.0.3.10.5432: Flags [S], length 0"
+response = "IP 10.0.3.10.5432 > 10.0.2.10.40123: Flags [S.], length 0"
+app, db = handshakes(request), handshakes(request + "\n" + response)
+assert reply_drop(app, db, 40123)["db_sent_syn_ack"]
+for wrong_app, wrong_db, port in ((handshakes(request + "\n" + response), db, 40123),
+                                  (app, app, 40123), (app, db, 40124)):
+    try:
+        reply_drop(wrong_app, wrong_db, port)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("A different tuple, missing reply, or received reply proved a false drop")
+
+with tempfile.TemporaryDirectory() as directory:
+    journal = Path(directory) / "recovery.private.json"
+    fault = Faults(inventory, "offline", Path("unused"), journal)
+    order = []
+    def discover():
+        fault.context = {"run": "a" * 16}
+        fault.save("armed")
+        order.append("saved")
+    def broken():
+        assert json.loads(journal.read_text())["state"] == "armed"
+        order.append("fault")
+        raise RuntimeError("interrupted exercise")
+    with patch.object(fault, "identity"), patch.object(fault, "traffic"), \
+         patch.object(fault, "discover", side_effect=discover), \
+         patch.object(fault, "private_default", side_effect=broken), \
+         patch.object(fault, "restore", side_effect=lambda: order.append("restore")):
+        try:
+            fault.run()
+        except RuntimeError as error:
+            assert "interrupted exercise" in str(error)
+        else:
+            raise AssertionError("Interrupted exercise succeeded")
+    assert order == ["saved", "fault", "restore"], "Record recovery before mutation and restore on failure"
+    order.clear()
+    with patch.object(fault, "validate_recovery"), \
+         patch.object(fault, "restore_acl", side_effect=RuntimeError("ACL repair failed")), \
+         patch.object(fault, "restore_sql", side_effect=lambda: order.append("sql")), \
+         patch.object(fault, "restore_route", side_effect=lambda: order.append("route")):
+        try:
+            fault.restore()
+        except RuntimeError as error:
+            assert "ACL repair failed" in str(error)
+        else:
+            raise AssertionError("Failed recovery was reported successful")
+    assert order == ["sql", "route"], "One failed repair must not skip the other repairs"
+    assert json.loads(journal.read_text())["state"] == "armed", "Failed recovery must preserve the journal"
+    with patch.object(fault, "identity"), patch.object(fault, "traffic") as traffic:
+        try:
+            fault.run()
+        except RuntimeError as error:
+            assert "--restore-only" in str(error)
+        else:
+            raise AssertionError("An interrupted journal was overwritten")
+        traffic.assert_not_called()
+    saved = json.loads(journal.read_text())
+    saved["account_id"] = "987654321098"
+    journal.write_text(json.dumps(saved))
+    with patch.object(fault, "identity"), patch.object(fault, "restore") as restore:
+        try:
+            fault.recover()
+        except RuntimeError as error:
+            assert "differs" in str(error)
+        else:
+            raise AssertionError("A journal from another account was used")
+        restore.assert_not_called()
+print("PASS: teardown guards, narrow rules, fault recovery, and matched packet evidence")

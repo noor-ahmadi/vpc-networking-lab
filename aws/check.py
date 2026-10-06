@@ -69,7 +69,7 @@ class Lab:
             if missing is not None and code == missing:
                 return None
             raise RuntimeError(f"AWS {args[0]} {args[1]}: {code}")
-        return json.loads(result.stdout)
+        return json.loads(result.stdout) if result.stdout.strip() else {}
 
     def identity(self):
         require(self.aws("sts", "get-caller-identity")["Account"] == self.inventory["account_id"],

@@ -1,5 +1,6 @@
 .cache/
 __pycache__/
+aws/captures/
 *.pcap
 *.pcapng
 .env
