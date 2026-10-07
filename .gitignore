@@ -1,4 +1,7 @@
 .cache/
+.playwright-cli/
+__pycache__/
+aws/captures/
 *.pcap
 *.pcapng
 .env
@@ -9,3 +12,8 @@
 *.tfstate
 *.tfstate.*
 *.tfplan
+*.tfvars
+*.tfvars.json
+crash.log
+crash.*.log
+*.private.json

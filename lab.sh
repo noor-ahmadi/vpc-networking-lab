@@ -16,13 +16,16 @@ identity() { stat -Lc '%d:%i' "$NETNS/$1"; }
 
 usage() {
     cat <<'USAGE'
-Usage: sudo ./lab.sh {up|down|status|check|arp}
+Usage: sudo ./lab.sh {up|down|status|check|arp|fault NAME|repair NAME}
 
   up      Create three subnet segments with independent routing policies.
   down    Remove this lab's namespaces; refuse busy or replaced ones.
-  status  Show addresses, routes, policy rules, and NAT/filter counters.
+  status  Show addresses, routes, policy rules, and firewall counters.
   check   Verify internal routing, public access, NAT, and isolated egress.
   arp     Capture an ARP request and reply on the public segment.
+  fault   Apply one failure: forwarding, private-route, nat-snat,
+          database, or return-ports.
+  repair  Restore the fixed lab baseline for one named failure.
 
 Requires Linux and root. See docs/local-lab.md for dependencies and topology.
 USAGE
@@ -91,6 +94,16 @@ connect() {
     ip -n vpc-switch link set "$port" master "$bridge" up
     ip -n "$namespace" address add "$address" dev "$interface"
     ip -n "$namespace" link set "$interface" up
+}
+
+configure_interfaces() {
+    ip netns exec "$1" bash -e <<'SYSCTLS'
+        for interface in /proc/sys/net/ipv4/conf/*; do
+            printf "0\n" > "$interface/send_redirects"
+            printf "0\n" > "$interface/accept_redirects"
+            printf "2\n" > "$interface/rp_filter"
+        done
+SYSCTLS
 }
 
 up() {
@@ -162,16 +175,13 @@ up() {
     done
     # Configure these after forwarding, which resets some IPv4 defaults.
     for name in "${NAMESPACES[@]}"; do
-        ip netns exec "$name" bash -e <<'SYSCTLS'
-            for interface in /proc/sys/net/ipv4/conf/*; do
-                printf "0\n" > "$interface/send_redirects"
-                printf "0\n" > "$interface/accept_redirects"
-                printf "2\n" > "$interface/rp_filter"
-            done
-SYSCTLS
+        configure_interfaces "$name"
     done
     ip netns exec vpc-nat nft -f "$ROOT/network/nat.nft"
     ip netns exec vpc-edge nft -f "$ROOT/network/edge.nft"
+    for name in web app db; do
+        ip netns exec "vpc-$name" nft -f "$ROOT/network/$name.nft"
+    done
     trap - EXIT
     printf 'Lab created: eight namespaces, subnet routing, public mappings, and private NAT.\n'
 }
@@ -194,10 +204,60 @@ status() {
         printf '\nvpc-router table %s\n' "$table"
         ip -n vpc-router route show table "$table"
     done
-    for name in vpc-nat vpc-edge; do
-        printf '\n%s NAT and filter rules\n' "$name"
+    for name in vpc-router vpc-nat vpc-edge vpc-web vpc-app vpc-db; do
+        printf '\n%s firewall rules\n' "$name"
         ip netns exec "$name" nft list ruleset
     done
+}
+
+fault_filter() {
+    local action=$1 namespace=$2 filename=$3
+    need nft
+    # These tables live only in this lab's owned namespaces.
+    if ip netns exec "$namespace" nft list table ip vpc_fault >/dev/null 2>&1; then
+        ip netns exec "$namespace" nft delete table ip vpc_fault
+    fi
+    if [[ $action == fault ]]; then
+        ip netns exec "$namespace" nft -f "$ROOT/network/$filename"
+    fi
+}
+
+alter_fault() {
+    local action=$1 name=$2
+    case "$name" in
+        forwarding|private-route|nat-snat|database|return-ports) ;;
+        *) die "Unknown fault: $name" ;;
+    esac
+    require_lab
+    case "$name" in
+        forwarding)
+            if [[ $action == fault ]]; then
+                ip netns exec vpc-router sysctl -q -w net.ipv4.ip_forward=0
+            else
+                ip netns exec vpc-router sysctl -q -w net.ipv4.ip_forward=1
+                configure_interfaces vpc-router
+            fi
+            ;;
+        private-route)
+            if [[ $action == fault ]]; then
+                ip -n vpc-router route replace table 102 unreachable default
+            else
+                ip -n vpc-router route replace table 102 default via 10.0.1.20 dev public
+            fi
+            ;;
+        nat-snat)
+            need nft
+            if [[ $action == fault ]]; then
+                ip netns exec vpc-nat nft flush chain ip vpc_nat postrouting
+            else
+                { printf 'delete table ip vpc_nat\n'; cat "$ROOT/network/nat.nft"; } |
+                    ip netns exec vpc-nat nft -f -
+            fi
+            ;;
+        database) fault_filter "$action" vpc-db fault-database.nft ;;
+        return-ports) fault_filter "$action" vpc-router fault-return-ports.nft ;;
+    esac
+    printf '%s: %s\n' "$action" "$name"
 }
 
 check() {
@@ -305,10 +365,14 @@ capture_arp() {
 
 case "${1:-help}" in
     help|-h|--help) usage; exit 0 ;;
-    up|down|status|check|arp) action=$1 ;;
+    up|down|status|check|arp|fault|repair) action=$1 ;;
     *) usage >&2; exit 2 ;;
 esac
-[[ $# == 1 ]] || die 'Expected exactly one command'
+if [[ $action == fault || $action == repair ]]; then
+    [[ $# == 2 ]] || die 'Expected exactly one fault name'
+else
+    [[ $# == 1 ]] || die 'Expected exactly one command'
+fi
 [[ $(uname -s) == Linux ]] || die 'Run this inside Linux'
 (( EUID == 0 )) || die 'Root is required; use sudo'
 for command in ip sysctl stat flock grep; do need "$command"; done
@@ -319,5 +383,6 @@ trap 'exit 143' TERM
 
 case "$action" in
     arp) capture_arp ;;
+    fault|repair) alter_fault "$action" "$2" ;;
     *) "$action" ;;
 esac

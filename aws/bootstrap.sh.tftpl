@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+export DEBIAN_FRONTEND=noninteractive
+
+%{ if role == "web" ~}
+packages=(nginx)
+%{ endif ~}
+%{ if role == "app" ~}
+packages=(python3 python3-psycopg2)
+%{ endif ~}
+%{ if role == "db" ~}
+packages=(postgresql-16)
+%{ endif ~}
+# The web EIP association can finish after the instance starts cloud-init.
+for attempt in {1..12}; do
+    if apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 \
+        -o APT::Update::Error-Mode=any update && apt-get install -y "$${packages[@]}"; then
+        break
+    fi
+    (( attempt < 12 )) || exit 1
+    sleep 5
+done
+
+%{ if role == "web" ~}
+cat > /etc/nginx/sites-available/vpc-lab <<'NGINX'
+server {
+    listen 10.0.1.10:80;
+    location / {
+        proxy_pass http://10.0.2.10:8080;
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 5s;
+        proxy_set_header Host $host;
+    }
+}
+NGINX
+chmod 644 /etc/nginx/sites-available/vpc-lab
+rm -f /etc/nginx/sites-enabled/default
+ln -sf /etc/nginx/sites-available/vpc-lab /etc/nginx/sites-enabled/vpc-lab
+nginx -t
+# A reload cannot rebind the package's existing wildcard listener to this IP.
+systemctl enable nginx
+systemctl restart nginx
+%{ endif ~}
+%{ if role == "app" ~}
+install -d -m 755 /opt/vpc-lab
+printf '%s' '${server}' | base64 -d > /opt/vpc-lab/server.py
+chmod 644 /opt/vpc-lab/server.py
+printf 'VPC_DB_PASSWORD=%s\n' '${db_password}' > /etc/vpc-lab.env
+cat > /etc/systemd/system/vpc-app.service <<'UNIT'
+[Unit]
+Description=VPC lab application
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=nobody
+Group=nogroup
+EnvironmentFile=/etc/vpc-lab.env
+ExecStart=/usr/bin/python3 /opt/vpc-lab/server.py
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+chmod 644 /etc/systemd/system/vpc-app.service
+systemctl daemon-reload
+systemctl enable --now vpc-app.service
+%{ endif ~}
+%{ if role == "db" ~}
+cat > /etc/postgresql/16/main/conf.d/vpc-lab.conf <<'PGCONFIG'
+listen_addresses = '10.0.3.10'
+password_encryption = 'scram-sha-256'
+PGCONFIG
+cat > /etc/postgresql/16/main/pg_hba.conf <<'HBA'
+local all postgres peer
+host vpc_lab vpc_app 10.0.2.10/32 scram-sha-256
+HBA
+chown postgres:postgres /etc/postgresql/16/main/pg_hba.conf /etc/postgresql/16/main/conf.d/vpc-lab.conf
+systemctl restart postgresql@16-main
+runuser -u postgres -- psql -v ON_ERROR_STOP=1 <<'SQL'
+CREATE ROLE vpc_app LOGIN PASSWORD '${db_password}';
+CREATE DATABASE vpc_lab;
+SQL
+printf '%s' '${seed}' | base64 -d | runuser -u postgres -- psql -v ON_ERROR_STOP=1 -d vpc_lab
+%{ endif ~}
+
+install -d -m 700 /var/lib/vpc-lab
+touch /var/lib/vpc-lab/bootstrap-complete

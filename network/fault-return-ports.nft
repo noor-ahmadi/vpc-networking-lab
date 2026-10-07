@@ -1,0 +1,8 @@
+# Stateless subnet exercise: replies need permission even for allowed requests.
+table ip vpc_fault {
+    counter denied_return {}
+    chain forward {
+        type filter hook forward priority -10; policy accept;
+        iifname "isolated" oifname "private" ip saddr 10.0.3.10 ip daddr 10.0.2.10 tcp sport 5432 tcp dport 1024-65535 counter name denied_return drop
+    }
+}

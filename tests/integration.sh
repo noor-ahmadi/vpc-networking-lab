@@ -42,6 +42,10 @@ snapshot_host() {
 }
 
 snapshot_host > "$scratch/before"
+expect_failure bash ./lab.sh fault forwarding
+expect_failure bash ./lab.sh repair private-route
+expect_failure bash ./lab.sh fault
+expect_failure bash ./lab.sh repair private-route extra
 ip netns add vpc-sentinel
 sentinel_identity=$(stat -Lc '%d:%i' /run/netns/vpc-sentinel)
 
@@ -72,9 +76,12 @@ printf 'PASS: partial setup failure rolls back created namespaces\n'
 for cycle in 1 2; do
     printf '\nLifecycle cycle %s\n' "$cycle"
     bash ./lab.sh up
+    expect_failure bash ./lab.sh fault unknown
+    expect_failure bash ./lab.sh repair unknown
     bash ./lab.sh status
     bash ./lab.sh check
     python3 -u tests/traffic.py
+    python3 -u tests/services.py
     # A healthy off-VPC destination exists only through the router's main table.
     ip -n vpc-web address add 192.0.2.10/32 dev lo
     ip -n vpc-router route add 192.0.2.10/32 via 10.0.1.10 dev public
@@ -142,12 +149,16 @@ for cycle in 1 2; do
         bash ./lab.sh check
         printf 'PASS: connectivity checks detect and recover from a miswired port\n'
 
-        ip netns exec vpc-router sysctl -q -w net.ipv4.ip_forward=0
+        fault_started=$SECONDS
+        bash ./lab.sh fault forwarding
+        bash ./lab.sh fault forwarding
         ip netns exec vpc-web ping -n -c 1 -W 2 10.0.1.20 >/dev/null
         expect_failure bash ./lab.sh check
-        ip netns exec vpc-router sysctl -q -w net.ipv4.ip_forward=1
+        bash ./lab.sh repair forwarding
+        bash ./lab.sh repair forwarding
         bash ./lab.sh check
         printf 'PASS: forwarding failure breaks routed traffic while local peers still work\n'
+        printf 'RESULT: {"case":"forwarding","source":"vpc-web 10.0.1.10","destination":"10.0.2.10 ICMP","expected":"denied during fault; reachable after repair","observed":"denied during fault; reachable after repair","duration_seconds":%s,"evidence":"healthy same-subnet peer; routed check fails; full check passes after repair"}\n' "$((SECONDS - fault_started))"
 
         ip -n vpc-db route delete default
         ip netns exec vpc-db ping -n -c 1 -W 2 10.0.3.1 >/dev/null
@@ -180,6 +191,9 @@ ip netns delete vpc-web
 ip netns add vpc-web
 replacement_identity=$(stat -Lc '%d:%i' /run/netns/vpc-web)
 expect_failure bash ./lab.sh down
+expect_failure bash ./lab.sh fault forwarding
+expect_failure bash ./lab.sh repair nat-snat
+[[ $(ip netns exec vpc-router sysctl -n net.ipv4.ip_forward) == 1 ]] || fail 'Fault command changed an unverified lab'
 [[ $(stat -Lc '%d:%i' /run/netns/vpc-web) == "$replacement_identity" ]] || fail 'Replaced namespace was deleted'
 [[ -e /run/netns/vpc-switch ]] || fail 'Ownership failure partially removed the lab'
 ip netns delete vpc-web
@@ -189,4 +203,4 @@ printf 'PASS: replaced namespace is preserved\n'
 ip netns delete vpc-sentinel
 snapshot_host > "$scratch/after"
 diff -u "$scratch/before" "$scratch/after" || fail 'Host network configuration changed'
-printf '\nPASS: two full cycles, ownership guards, ARP, subnet policies, HTTP, NAT captures and faults, and unchanged host network\n'
+printf '\nPASS: two full cycles, ownership guards, ARP, subnet policies, services and access rules, packet-proven faults and repairs, and unchanged host network\n'

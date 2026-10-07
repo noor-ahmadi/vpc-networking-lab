@@ -4,8 +4,14 @@ The lab creates three separate Ethernet segments and routes IPv4 traffic
 between them. `vpc-router` has an interface in each segment, with forwarding
 enabled. Each workload uses its subnet's `.1` address as its default gateway.
 An edge namespace connects the public subnet to a sealed internet fixture,
-and a separate NAT namespace provides private outbound access. Application
-services, PostgreSQL, and the AWS deployment are still to come.
+and a separate NAT namespace provides private outbound access. Nginx calls
+a private Python app, which queries PostgreSQL in the isolated subnet.
+The [AWS reproduction](aws.md) is verified separately. See the
+[topology and packet walkthrough](topology.md) or [recorded demo](demo.md)
+for the complete flow.
+
+The [failure exercises](failures.md) provide named faults, diagnosis commands,
+and repairs for forwarding, private egress, SNAT, database access, and reply ports.
 
 | Segment | Bridge in `vpc-switch` | Namespace interfaces |
 | --- | --- | --- |
@@ -72,8 +78,8 @@ the forward decision with:
 sudo ip -n vpc-router route get 10.0.3.10 from 10.0.2.10 iif private
 ```
 
-All three subnets can communicate internally. Service-level access rules are
-a later step; the isolated subnet's routing policy only blocks external traffic.
+All three subnets have internal routes. Workload firewall rules separately
+control TCP service access; the isolated routing policy blocks external traffic.
 
 ## NAT and public access
 
@@ -95,9 +101,10 @@ port. Fixed addresses use explicit SNAT in [nat.nft](../network/nat.nft) and
 [edge.nft](../network/edge.nft). Masquerade would select an interface address
 dynamically; it is unnecessary for these fixed addresses.
 
-The edge also maps new incoming traffic for `203.0.113.20` to the public web
-host. Its forward filter drops direct incoming traffic to VPC addresses and
-new connections to the NAT public mapping. Outbound traffic must already
+The edge also maps incoming traffic for `203.0.113.20` to the public web
+host, permitting TCP 80 and diagnostic ICMP. Its forward filter drops other
+new incoming traffic, direct traffic to VPC addresses, and new connections
+to the NAT public mapping. Outbound traffic must already
 have one of the two mapped sources; the edge does not rescue a broken NAT
 by translating arbitrary private addresses. The outside fixture has no VPC
 return route, so a packet that escapes without translation cannot get a reply.
@@ -122,16 +129,62 @@ Network namespaces share the host kernel and filesystem. Use a disposable
 Linux environment for experiments. The scripts modify only their own network
 namespaces, with no host forwarding, route, or firewall changes.
 
-Next: the application/database flow and service-level access rules.
-The eventual AWS version will reproduce the selected traffic
-behavior; it will not reproduce AWS's internal network implementation.
+The AWS version reproduces selected traffic behavior. Its managed network
+implementation differs from these Linux mechanisms.
+
+## Application and service access
+
+Install `nginx`, `postgresql-16`, `python3`, and `python3-psycopg2` alongside
+the networking tools. After `sudo ./lab.sh up`, start the demo in a terminal:
+
+```sh
+sudo python3 app/services.py
+```
+
+Wait for `ready`, then use a second terminal to query it from the external fixture:
+
+```sh
+sudo ip netns exec vpc-internet python3 -c \
+  "from urllib.request import urlopen; print(urlopen('http://203.0.113.20/message', timeout=6).read().decode())"
+```
+
+`/health` returns app health without querying the database. `/message` reads
+the seeded value, `Hello from the isolated subnet`, over TCP at `10.0.3.10:5432`.
+Nginx accepts the public request on `10.0.1.10:80` and opens a separate TCP
+connection to `10.0.2.10:8080`; the response's `peer` is the proxy's private IP.
+The app uses a read-only database role with a generated SCRAM password.
+No shared PostgreSQL Unix socket is enabled. A database connection failure
+returns HTTP 503 while `/health` remains available; unknown paths return 404.
+
+| Workload | New TCP ingress | New TCP egress |
+| --- | --- | --- |
+| Web | TCP 80 from external fixture `203.0.113.10` | App TCP 8080; external segment TCP 80, 443, 8080 |
+| App | TCP 8080 from web `10.0.1.10` | Database TCP 5432; external segment TCP 80, 443, 8080 |
+| Database | TCP 5432 from app `10.0.2.10` | None |
+
+The input/output rules live in `network/{web,app,db}.nft`. Established and
+related traffic is allowed in both directions, so the database can answer an
+app query without permission to open new connections. Named `denied_input`
+and `denied_output` counters identify rejected traffic. Loopback and ICMP are
+permitted for local readiness and routing diagnostics; this TCP service matrix
+does not imply ICMP isolation. These host rules model access intent with fixed
+addresses, not AWS security group identities or AWS's implementation.
+
+The launcher creates its own temporary PostgreSQL cluster and Nginx files.
+Ctrl+C stops its processes and removes those files before `sudo ./lab.sh down`.
+It does not start or stop system services. Each launch resets the demo data.
+The database administration trust entry applies only to its own `10.0.3.10`
+source; the app connects from `10.0.2.10` using SCRAM. This is a sealed,
+disposable demo, not a production application or durable database.
 
 References: [network namespaces](https://man7.org/linux/man-pages/man7/network_namespaces.7.html),
 [veth pairs](https://man7.org/linux/man-pages/man4/veth.4.html),
 [Linux routes](https://man7.org/linux/man-pages/man8/ip-route.8.html),
 [policy rules](https://man7.org/linux/man-pages/man8/ip-rule.8.html),
 [IPv4 sysctls](https://docs.kernel.org/networking/ip-sysctl.html),
-[nftables](https://netfilter.org/projects/nftables/manpage.html).
+[nftables](https://netfilter.org/projects/nftables/manpage.html),
+[Nginx proxying](https://nginx.org/en/docs/http/ngx_http_proxy_module.html),
+[PostgreSQL authentication](https://www.postgresql.org/docs/16/auth-pg-hba-conf.html).
 
 ## Verification
 
@@ -162,12 +215,37 @@ observed client address, and verifies public HTTP in both directions. It also:
   fails while the destination remains healthy, then restores the rules.
 
 Every test server and capture is stopped before teardown. These echo services
-are test fixtures, not the eventual application or database. Install `python3`
-and `conntrack` to run them as part of the integration suite.
+are temporary network fixtures on the allowed ports; they stop before the
+real application and database checks start. Install `python3` and `conntrack`
+to run them as part of the integration suite.
+
+`tests/services.py` starts the actual services in each lifecycle cycle. It
+queries the seeded row through the public proxy, updates that row inside the
+database namespace, and confirms the next response reads the new value. It
+checks proxy-to-database and new database-to-app denial at both the source
+output and destination input filters, with healthy destinations and increasing
+deny counters. A live listener on an unused web port proves external rejection
+at the edge rather than failure from a closed port. It also verifies that the
+full database path survives a lost NAT interface, and that a deliberate
+app-to-database drop returns 503 while health stays up, then recovers after
+repair. Removing the private NAT default rejects egress without falling
+through to `main`, while public HTTP and database queries survive. A separate
+stateless router filter drops PostgreSQL replies to the app's ephemeral port:
+simultaneous captures show the app SYN, the database SYN-ACK, and no delivered
+SYN-ACK, with an increasing router drop counter. A fresh query succeeds after
+repair. Named fault results include source, destination, outcome, elapsed
+seconds, and evidence. All demo processes exit before namespace teardown.
+An injected Nginx startup failure also checks that the launcher stops the app
+and database and removes its temporary files before exiting.
 
 The suite also compares host interfaces, addresses, routes, routing rules, forwarding settings, and
 firewall rules before and after. Install `nftables` for this comparison and
 `shellcheck` for shell linting.
+
+CI uses `sudo unshare --net bash tests/integration.sh` to give this comparison
+its own network stack. Runner interfaces can appear during a job; they remain
+outside that stack. The full snapshot comparison still detects changes to the
+test's starting network, and the namespace ownership checks still run.
 
 For an isolated test on a Linux Docker engine, build the tool image, then run
 with networking disabled. Namespace creation requires a privileged container;
@@ -179,5 +257,6 @@ docker run --rm --privileged --network none \
   --mount "type=bind,source=$PWD,target=/workspace,readonly" vpc-lab-test
 ```
 
-The image supplies tools only. The network is created explicitly by `lab.sh`,
-and all connectivity checks run without an external network connection.
+The image supplies the tools and service binaries. `lab.sh` creates the network,
+and the service launcher starts its own demo processes. All connectivity checks
+run without an external network connection.
