@@ -6,7 +6,9 @@ enabled. Each workload uses its subnet's `.1` address as its default gateway.
 An edge namespace connects the public subnet to a sealed internet fixture,
 and a separate NAT namespace provides private outbound access. Nginx calls
 a private Python app, which queries PostgreSQL in the isolated subnet.
-The AWS deployment is still to come.
+The [AWS reproduction](aws.md) is verified separately. See the
+[topology and packet walkthrough](topology.md) or [recorded demo](demo.md)
+for the complete flow.
 
 The [failure exercises](failures.md) provide named faults, diagnosis commands,
 and repairs for forwarding, private egress, SNAT, database access, and reply ports.
@@ -127,8 +129,8 @@ Network namespaces share the host kernel and filesystem. Use a disposable
 Linux environment for experiments. The scripts modify only their own network
 namespaces, with no host forwarding, route, or firewall changes.
 
-The eventual AWS version will reproduce the selected traffic
-behavior; it will not reproduce AWS's internal network implementation.
+The AWS version reproduces selected traffic behavior. Its managed network
+implementation differs from these Linux mechanisms.
 
 ## Application and service access
 

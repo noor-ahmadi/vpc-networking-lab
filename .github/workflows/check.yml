@@ -23,11 +23,15 @@ jobs:
           bash -n tests/integration.sh
           bash -n tests/aws.sh
           bash -n tests/aws_postgres.sh
-          shellcheck lab.sh tests/integration.sh tests/aws.sh tests/aws_postgres.sh
+          bash -n demo/run.sh
+          bash -n tests/demo.sh
+          shellcheck lab.sh tests/integration.sh tests/aws.sh tests/aws_postgres.sh demo/run.sh tests/demo.sh
       - name: Exercise the network and cleanup
         # Runner interfaces can change while the job runs. Keep every snapshot
         # check in a separate network stack instead of ignoring those changes.
         run: sudo unshare --net bash tests/integration.sh
+      - name: Check the recorded demonstration sequence
+        run: sudo unshare --net bash tests/demo.sh
       - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
           terraform_version: 1.16.5

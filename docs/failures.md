@@ -100,8 +100,9 @@ connection-state exception, on traffic from the isolated to the private
 interface. It models the reply-port failure of a stateless subnet filter.
 AWS [network ACLs](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-network-acls.html)
 require explicit reply permissions, while security groups track connections.
-The local rule demonstrates that traffic behavior using Linux; AWS deployment
-and verification are still pending.
+The local rule demonstrates that traffic behavior using Linux. The
+[AWS exercises](aws-failures.md) verify the corresponding custom-NACL reply
+failure on a real deployment, with separate guest captures and recovery.
 
 Capture the two sides in separate terminals before requesting `/message`:
 
